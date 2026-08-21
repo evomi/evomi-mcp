@@ -22,6 +22,7 @@ from .annotations import (
     LOOKUP,
 )
 from .proxy import (
+    MEASURABLE_PRODUCTS,
     PRODUCT_CODES,
     PRODUCTS,
     ROTATABLE_PRODUCTS,
@@ -29,10 +30,11 @@ from .proxy import (
     build_password_modifiers,
     curl_example,
     format_proxy,
+    normalise_country,
     resolve_endpoint,
 )
 from .public_client import EvomiPublicAPIError, EvomiPublicClient
-from .security import mask_secret
+from .security import MASK, mask_secret
 
 _public_client: EvomiPublicClient | None = None
 
@@ -181,15 +183,16 @@ def proxy_tool_definitions() -> list[Tool]:
         "countries": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Two-letter ISO country codes, e.g. ['US','DE']. Several codes "
-            "means one is picked at random per connection. City and region targeting "
-            "require exactly one country.",
+            "description": "Two-letter ISO 3166-1 alpha-2 country codes, e.g. ['US','DE'] "
+            "(the United Kingdom is 'GB'). Several codes means one is picked at random "
+            "per connection. City and region targeting accept at most one country, and "
+            "work without one.",
         },
-        "region": {"type": "string", "description": "Region/state name, exactly as returned by list_proxy_targeting_options."},
-        "city": {"type": "string", "description": "City name, exactly as returned by list_proxy_targeting_options."},
+        "region": {"type": "string", "description": "Region/state, as the 'id' from list_proxy_targeting_options, e.g. 'uttar.pradesh'."},
+        "city": {"type": "string", "description": "City, as the 'id' from list_proxy_targeting_options, e.g. 'new.york'."},
         "zip_code": {"type": "string", "description": "Postal code, e.g. '90210'. Premium Residential and Core Residential only."},
-        "continent": {"type": "string", "description": "Continent name, e.g. 'europe'."},
-        "isp": {"type": "string", "description": "ISP name, e.g. 'comcast'. Not available on Core Residential."},
+        "continent": {"type": "string", "description": "Continent, lowercase and dot-separated: 'africa', 'asia', 'europe', 'north.america', 'oceania', 'south.america'."},
+        "isp": {"type": "string", "description": "ISP, as the 'id' from list_proxy_targeting_options, e.g. 'comcastcable'. It is not the ISP's name in lower case. Not available on Core Residential."},
         "asn": {"type": "string", "description": "Autonomous system number, e.g. 'AS7922'."},
         "session": {
             "type": "string",
@@ -320,6 +323,15 @@ def proxy_tool_definitions() -> list[Tool]:
                         "description": "url = scheme://user:pass@host:port (use this for code), "
                         "1 = user:pass@host:port, 2 = host:port:user:pass, 3 = user:pass:host:port.",
                     },
+                    "runnable_curl_example": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Put the real password into curl_example so it can be "
+                        "pasted and run. Off by default: curl_example is the field most "
+                        "likely to be copied into a terminal, a ticket or a screenshot, and "
+                        "the password is masked in it. The connection strings themselves "
+                        "always carry the real password either way.",
+                    },
                     "static_ip": {"type": "string", "description": "Static Residential only: which rented IP to exit from. All rented IPs are returned if omitted."},
                     "gateway_host": {
                         "type": "string",
@@ -396,7 +408,7 @@ def proxy_tool_definitions() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "product": {"type": "string", "enum": product_enum, "description": product_help},
+                    "product": {"type": "string", "enum": list(MEASURABLE_PRODUCTS), "description": product_help},
                     "period": {"type": "string", "enum": list(USAGE_PERIODS), "default": "3d", "description": "24h gives hourly buckets; 3d and 7d give daily buckets."},
                     "include_buckets": {"type": "boolean", "default": True, "description": "Include the per-bucket series as well as the total."},
                     "max_buckets": {"type": "integer", "default": 24, "description": "Cap on how many of the most recent buckets to return."},
@@ -411,9 +423,10 @@ def proxy_tool_definitions() -> list[Tool]:
                 "Look up which countries, regions, cities, ISPs or continents can be "
                 "targeted on a given Evomi proxy product, with an optional search "
                 "filter. Call this before build_proxy_connection_string whenever a city, "
-                "region or ISP is involved: those values must match exactly, and this "
-                "returns the accepted spellings. The full catalogue is large, so results "
-                "are filtered and capped. Returns no credentials. Read-only."
+                "region or ISP is involved. Every entry gives an 'id' and a 'name': the "
+                "'id' is what the gateway accepts and what to pass back, the 'name' is "
+                "the display form. The full catalogue is large, so results are filtered "
+                "and capped. Returns no credentials. Read-only."
             ),
             inputSchema={
                 "type": "object",
@@ -738,6 +751,33 @@ async def _get_proxy_credentials(client: EvomiPublicClient, product: str) -> str
     )
 
 
+def _curl_password(password: str, secret: str | None, arguments: dict[str, Any]) -> str:
+    """
+    The password to show in `curl_example`, masked unless the caller opted in.
+
+    Only the account's secret is replaced; the rest of the password — the
+    `_key-value` modifiers, or the `<ip>_` prefix on a Static Residential entry
+    — stays readable, since that is the part of the example worth reading and
+    none of it is a credential.
+    """
+    if arguments.get("runnable_curl_example"):
+        return password
+
+    return password.replace(secret, MASK) if secret else password
+
+
+def _curl_note(arguments: dict[str, Any]) -> str | None:
+    """Say how to get the runnable form, when the example is masked."""
+    if arguments.get("runnable_curl_example"):
+        return None
+
+    return (
+        "The password in curl_example is masked. Substitute the one from the "
+        "connection string above, or call again with runnable_curl_example set to "
+        "true."
+    )
+
+
 def _bounded_count(value: Any, parameter: str) -> int:
     """
     Read a proxy count, refusing anything past MAX_PROXIES_PER_CALL.
@@ -860,6 +900,9 @@ async def _build_connection_strings(
             "Session ids were generated. Pass one back as session_id to keep using that "
             "IP, or to rotate_proxy_session to change it."
         )
+    curl_note = _curl_note(arguments)
+    if curl_note:
+        notes.append(curl_note)
 
     return _json(
         {
@@ -874,7 +917,11 @@ async def _build_connection_strings(
             # Built from the first entry's password, so the command verifies
             # proxies[0]. With a generated session every entry has its own.
             "curl_example": curl_example(
-                scheme, host, port, username, first_password or base_password
+                scheme,
+                host,
+                port,
+                username,
+                _curl_password(first_password or base_password, base_password, arguments),
             ),
             "notes": notes or None,
             "contains_credentials": True,
@@ -923,12 +970,14 @@ def _build_static_strings(
     selected = ips if wanted else ips[:count]
     proxies: list[dict[str, Any]] = []
     first_password: str | None = None
+    first_secret: str | None = None
     for ip in selected:
         if not ip["ip"] or not ip["password"]:
             continue
         password = f"{ip['ip']}_{ip['password']}"
         if first_password is None:
             first_password = password
+            first_secret = ip["password"]
         proxies.append(
             {
                 "ip": ip["ip"],
@@ -953,7 +1002,11 @@ def _build_static_strings(
             # their shape.
             "curl_example": (
                 curl_example(
-                    scheme, host, port, username or "USERNAME", first_password
+                    scheme,
+                    host,
+                    port,
+                    username or "USERNAME",
+                    _curl_password(first_password, first_secret, arguments),
                 )
                 if first_password
                 else None
@@ -962,6 +1015,7 @@ def _build_static_strings(
                 "The exit IP is selected by the '<ip>_' prefix on the password; "
                 "geo targeting and sessions do not apply.",
             ]
+            + ([note] if (note := _curl_note(arguments)) and first_password else [])
             + (
                 []
                 if entry.get("endpoint") or arguments.get("gateway_host")
@@ -1011,7 +1065,7 @@ async def _generate_proxy_list(
         "format": arguments.get("format", "1"),
         "protocol": arguments.get("protocol", "http"),
         "prepend_protocol": "true" if arguments.get("prepend_protocol", True) else "false",
-        "countries": ",".join(c.strip().upper() for c in countries) if countries else None,
+        "countries": ",".join(normalise_country(c) for c in countries) if countries else None,
         "city": arguments.get("city"),
         "region": arguments.get("region"),
         "isp": arguments.get("isp"),
@@ -1038,10 +1092,23 @@ async def _get_proxy_usage(client: EvomiPublicClient, arguments: dict[str, Any])
     product = arguments["product"]
     period = arguments.get("period", "3d")
 
+    if product not in PRODUCTS:
+        raise ProxyOptionError(
+            f"Unknown product '{product}'. Valid products: {', '.join(PRODUCT_CODES)}."
+        )
+
+    usage_code = PRODUCTS[product]["usage_code"]
+    if not usage_code:
+        raise ProxyOptionError(
+            f"{PRODUCTS[product]['name']} is billed per rented IP rather than by "
+            "bandwidth, so the usage endpoint does not cover it. Use "
+            "list_proxy_products for what the account holds."
+        )
+
     if period not in USAGE_PERIODS:
         raise ProxyOptionError(f"period must be one of: {', '.join(USAGE_PERIODS)}.")
 
-    payload = await client.get_usage(product=product, period=period)
+    payload = await client.get_usage(product=usage_code, period=period)
     meta = payload.get("meta") or {}
     products = ((payload.get("data") or {}).get("bandwidth") or {}).get("products") or []
 
@@ -1077,11 +1144,14 @@ async def _get_proxy_usage(client: EvomiPublicClient, arguments: dict[str, Any])
 
 def _normalise_options(raw: Any) -> list[dict[str, Any]]:
     """
-    Flatten the several shapes GET /public/settings uses into name/value pairs.
+    Flatten the several shapes GET /public/settings uses into `id` and `name`.
 
-    The payload nests differently per field — a code-to-name map for countries, a
-    `{"data": [...]}` wrapper for cities and regions, objects carrying `value`
-    and `countryCode` for ISPs — so normalise rather than assume.
+    `id` is the value the gateway accepts in a password modifier and `name` is
+    the display form, for every kind alike. The payload states them differently
+    per field — a code-to-name map for countries, a `{"data": [...]}` wrapper of
+    objects already carrying both for cities and regions, an id-keyed map whose
+    entries hold a `label` for ISPs and a `name` for continents, a bare list for
+    ASNs — so each is mapped onto the pair rather than passed through.
     """
     if raw is None:
         return []
@@ -1093,30 +1163,34 @@ def _normalise_options(raw: Any) -> list[dict[str, Any]]:
 
     if isinstance(raw, dict):
         for key, value in raw.items():
-            if isinstance(value, dict):
-                option = {"name": key}
-                for field in ("value", "countryCode", "code", "name"):
-                    if field in value and not isinstance(value[field], (dict, list)):
-                        option[field] = value[field]
-                options.append(option)
+            option: dict[str, Any] = {"id": key, "name": key}
+
+            if isinstance(value, str):
+                option["name"] = value
+            elif isinstance(value, dict):
+                option["name"] = value.get("label") or value.get("name") or key
+                countries = value.get("countries")
+                if isinstance(countries, list):
+                    option["countries"] = countries
+                elif isinstance(countries, dict):
+                    option["country_count"] = len(countries)
             elif isinstance(value, list):
-                options.append({"name": key, "count": len(value)})
-            else:
-                options.append({"name": key, "value": value})
+                option["count"] = len(value)
+
+            options.append(option)
     elif isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict):
-                options.append(
-                    {
-                        k: v
-                        for k, v in item.items()
-                        if not isinstance(v, (dict, list))
-                    }
-                    or {"name": str(item)}
-                )
+                identifier = item.get("id") or item.get("name")
+                option = {"id": identifier, "name": item.get("name") or identifier}
+                for field, value in item.items():
+                    if field not in ("id", "name") and not isinstance(value, (dict, list)):
+                        option[field] = value
+                options.append(option)
             else:
-                options.append({"name": str(item)})
+                options.append({"id": str(item), "name": str(item)})
 
+    options.sort(key=lambda option: str(option.get("id") or ""))
     return options
 
 
@@ -1161,7 +1235,10 @@ async def _list_targeting_options(
             "match_count": len(options),
             "returned": min(len(options), limit),
             "options": options[:limit],
-            "note": "Use these values exactly as shown when targeting.",
+            "note": (
+                "Pass the 'id' when targeting — it is the value the gateway accepts. "
+                "'name' is the display form and is not interchangeable with it."
+            ),
         }
     )
 

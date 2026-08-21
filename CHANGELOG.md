@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1
+
+- Continent, country, region, city and ISP values are validated, and accepted in
+  display form. `list_proxy_targeting_options` returns an `id` and a `name`.
+- `curl_example` masks the password unless `runnable_curl_example` is set.
+- Usage requests send the product code that endpoint takes.
+- Scrape errors include the parameter the API objected to.
+
 ## 1.3.0
 
 - MCP server over stdio for Evomi's Public (proxy) and Scraper APIs, exposing 39

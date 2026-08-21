@@ -54,7 +54,7 @@ def test_the_check_rejects_a_version_that_does_not_match(capsys):
 
 
 def test_a_leading_v_in_a_tag_is_accepted():
-    """Tags are conventionally `v1.2.3`; the version string itself never is."""
+    """A git tag conventionally carries a `v` prefix; the version string never does."""
     declared = check_version.version_from_pyproject()
     assert check_version.main(["--expect", f"v{declared}"]) == 0
     assert check_version.main(["--expect", declared]) == 0

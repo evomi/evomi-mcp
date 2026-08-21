@@ -852,17 +852,50 @@ def _json_or_none(response: httpx.Response) -> Any:
 
 
 def _error_detail(payload: Any, api_key: str) -> str:
-    """The API's own error strings, if it sent any, scrubbed."""
+    """
+    The API's own error strings, if it sent any, scrubbed.
+
+    A rejected request states why it was rejected one level down, under
+    `error.details.validation_errors`, while the top of the body says only
+    'Invalid request parameters'. Both are collected, because the nested line is
+    the one that names the offending field.
+    """
     if not isinstance(payload, dict):
         return "."
 
-    parts = [
-        str(payload[field])
-        for field in ("error", "message")
-        if isinstance(payload.get(field), str) and payload[field]
-    ]
-    unique = list(dict.fromkeys(parts))
+    parts: list[str] = []
+
+    for field in ("error", "message", "detail"):
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            parts.append(value)
+        elif isinstance(value, dict):
+            parts.extend(_nested_error_strings(value))
+
+    unique = [part for part in dict.fromkeys(parts) if part]
     if not unique:
         return "."
 
     return ": " + scrub(" — ".join(unique), extra_secrets=(api_key,)) + "."
+
+
+def _nested_error_strings(error: dict[str, Any]) -> list[str]:
+    """Pull the readable lines out of a structured error object."""
+    parts: list[str] = []
+
+    for field in ("message", "error", "reason"):
+        value = error.get(field)
+        if isinstance(value, str) and value:
+            parts.append(value)
+
+    details = error.get("details")
+    if isinstance(details, dict):
+        for value in details.values():
+            if isinstance(value, str) and value:
+                parts.append(value)
+            elif isinstance(value, list):
+                parts.extend(str(item).strip(" :") for item in value if item)
+    elif isinstance(details, str) and details:
+        parts.append(details)
+
+    return parts

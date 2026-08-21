@@ -88,13 +88,16 @@ return live proxy passwords, which is what they are for, and `get_api_access`
 returns a service API key when asked with `include_api_key`. Every other tool
 returns balances, endpoints, usage and targeting data only.
 
-Three things bound that. Those four tools carry an instruction in their
+Four things bound that. Those four tools carry an instruction in their
 descriptions not to repeat the value back unless it was asked for directly — the
 MCP spec has no annotation for a sensitive result, so the description is the only
 channel that reaches the model. `generate_proxy_list` and
 `build_proxy_connection_string` return at most **50** entries per call, well under
 the 500 the Public API allows, and refuse a larger request rather than clamping
-it. And `EVOMI_HIDE_PROXY_PASSWORDS=1` turns disclosure off entirely:
+it. The `curl_example` that comes with a connection string has its password
+masked, since it is the field most likely to be pasted into a terminal or a
+ticket; pass `runnable_curl_example: true` for the form that can be run. And
+`EVOMI_HIDE_PROXY_PASSWORDS=1` turns disclosure off entirely:
 
 | Tool | With the flag set |
 | :--- | :--- |
@@ -173,7 +176,7 @@ Or if installed from source:
 | `build_proxy_connection_string` | Connection strings with geo targeting, sessions and expert filters, plus a curl check | **Yes** |
 | `generate_proxy_list` | Bulk proxy list (up to 50 per call) from the Public API generator | **Yes** |
 | `get_proxy_usage` | Bandwidth used over 24h / 3d / 7d, total and per bucket | No |
-| `list_proxy_targeting_options` | Searchable countries, regions, cities, ISPs and continents per product | No |
+| `list_proxy_targeting_options` | Searchable countries, regions, cities, ISPs and continents per product, each with the `id` the gateway accepts | No |
 | `rotate_proxy_session` | **Mutating** — force a sticky session onto a new exit IP | No |
 | `get_api_access` | Scraper and Browser access, credits, concurrency and endpoints (keys masked by default) | Only on request |
 | `list_browser_profiles` | Saved browser fingerprint profiles | No |

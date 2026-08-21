@@ -1,7 +1,7 @@
 """Tool handlers, against a stubbed Public API. No network.
 
 The `stub` fixture and the payload fixtures live in conftest.py, because the
-kill-switch audit in test_hidden_passwords.py drives the same handlers.
+kill-switch audit in test_password_hiding.py drives the same handlers.
 """
 
 import json
@@ -9,6 +9,7 @@ import json
 import pytest
 
 from evomi_mcp.proxy_tools import handle_proxy_tool
+from evomi_mcp.security import MASK
 from evomi_mcp.public_client import EvomiPublicAPIError
 from evomi_mcp.server import ToolError, call_tool
 
@@ -203,6 +204,84 @@ async def test_curl_example_verifies_the_first_proxy(stub, products_payload):
     assert f"session-{last_session}" not in result["curl_example"]
 
 
+# ─── curl_example ───────────────────────────────────────────────────────────────
+
+
+async def test_curl_example_masks_the_password_by_default(stub, products_payload):
+    """It is the field most likely to be pasted somewhere it will be kept."""
+    stub(products_payload)
+    result = await call("build_proxy_connection_string", {"product": "rp"})
+
+    assert "rp_secret_pw" not in result["curl_example"]
+    assert MASK in result["curl_example"]
+    assert result["contains_credentials"] is True
+
+
+async def test_the_connection_string_keeps_the_real_password(stub, products_payload):
+    """Masking the example must not touch what the caller actually asked for."""
+    stub(products_payload)
+    result = await call("build_proxy_connection_string", {"product": "rp"})
+
+    assert "rp_secret_pw" in result["proxies"][0]["proxy"]
+
+
+async def test_curl_example_keeps_the_targeting_readable_while_masked(
+    stub, products_payload
+):
+    """The modifiers are not credentials, and they are the point of the example."""
+    stub(products_payload)
+    result = await call(
+        "build_proxy_connection_string",
+        {"product": "rp", "countries": ["DE"], "session": "sticky"},
+    )
+
+    assert "rp_secret_pw" not in result["curl_example"]
+    assert "country-DE" in result["curl_example"]
+    assert f"session-{result['proxies'][0]['session_id']}" in result["curl_example"]
+
+
+async def test_curl_example_is_runnable_when_asked_for(stub, products_payload):
+    stub(products_payload)
+    result = await call(
+        "build_proxy_connection_string",
+        {"product": "rp", "runnable_curl_example": True},
+    )
+
+    assert "rp_secret_pw" in result["curl_example"]
+    assert MASK not in result["curl_example"]
+
+
+async def test_a_masked_example_says_how_to_get_the_runnable_one(stub, products_payload):
+    stub(products_payload)
+    result = await call("build_proxy_connection_string", {"product": "rp"})
+
+    assert any("runnable_curl_example" in note for note in result["notes"])
+
+
+async def test_static_residential_masks_only_the_secret_half(stub, products_payload):
+    """The rented IP is the readable half of a Static Residential password."""
+    stub(products_payload)
+    result = await call(
+        "build_proxy_connection_string", {"product": "static_residential"}
+    )
+
+    assert "static_pw_1" not in result["curl_example"]
+    assert "203.0.113.10" in result["curl_example"]
+    assert MASK in result["curl_example"]
+
+
+async def test_static_residential_curl_example_is_runnable_when_asked_for(
+    stub, products_payload
+):
+    stub(products_payload)
+    result = await call(
+        "build_proxy_connection_string",
+        {"product": "static_residential", "runnable_curl_example": True},
+    )
+
+    assert "203.0.113.10_static_pw_1" in result["curl_example"]
+
+
 async def test_proxies_are_objects_for_every_product(stub, products_payload):
     """One shape, so a consumer never has to branch on the product.
 
@@ -344,16 +423,79 @@ async def test_usage_can_omit_buckets(stub):
     assert "buckets" not in result
 
 
+async def test_generate_asks_for_datacenter_by_the_code_that_endpoint_takes(stub):
+    """/generate names the datacenter product `sdc`; `dcp` is a 400 there."""
+    client = stub({}, generate="user:pw@dcp.evomi.com:2000")
+    await call("generate_proxy_list", {"product": "dcp", "amount": 1})
+
+    assert client.calls[0][1]["product"] == "sdc"
+
+
+async def test_usage_asks_for_datacenter_by_the_code_that_endpoint_takes(stub):
+    """/usage names the datacenter product `sdc`; `dcp` is a 400 there."""
+    client = stub({}, usage=USAGE)
+    result = await call("get_proxy_usage", {"product": "dcp"})
+
+    assert client.calls[0][1]["product"] == "sdc"
+    assert result["product"] == "dcp"
+    assert result["name"] == "Datacenter (Shared)"
+
+
+@pytest.mark.parametrize("product", ["rp", "rpc", "mp"])
+async def test_usage_passes_the_other_products_through_unchanged(stub, product):
+    client = stub({}, usage=USAGE)
+    await call("get_proxy_usage", {"product": product})
+
+    assert client.calls[0][1]["product"] == product
+
+
+async def test_usage_refuses_a_product_the_endpoint_does_not_cover(stub):
+    client = stub({}, usage=USAGE)
+    with pytest.raises(Exception, match="billed per rented IP"):
+        await call("get_proxy_usage", {"product": "static_residential"})
+
+    assert client.calls == [], "no request should be made for a product it cannot answer"
+
+
+async def test_usage_only_offers_products_the_endpoint_serves():
+    from evomi_mcp.proxy_tools import proxy_tool_definitions
+    from evomi_mcp.server import _input_schema
+
+    usage = next(t for t in proxy_tool_definitions() if t.name == "get_proxy_usage")
+    offered = _input_schema(usage)["properties"]["product"]["enum"]
+
+    assert "static_residential" not in offered
+    assert set(offered) == {"rp", "rpc", "mp", "dcp"}
+
+
 # ─── list_proxy_targeting_options ───────────────────────────────────────────────
 
 
+# Shaped as GET /public/settings states each field: countries as a code-to-name
+# map, cities and regions as `{"data": [...]}` of objects already carrying both
+# spellings, ISPs and continents as id-keyed maps whose entries hold the display
+# form under different keys, ASNs as a bare list.
 SETTINGS = {
     "success": True,
     "data": {
         "rp": {
             "countries": {"DE": "Germany", "US": "United States", "IN": "India"},
-            "cities": {"data": [{"name": "berlin", "region": "BE"}, {"name": "boston", "region": "MA"}]},
-            "isp": {"Comcast": {"value": "comcast", "countryCode": "US"}},
+            "cities": {
+                "data": [
+                    {"id": "boston", "name": "Boston", "country_code": "US"},
+                    {"id": "berlin", "name": "Berlin", "country_code": "DE"},
+                ]
+            },
+            "regions": {"data": [{"id": "uttar.pradesh", "name": "Uttar Pradesh"}]},
+            "isp": {"comcastcable": {"label": "Comcast Cable", "countries": ["US"]}},
+            "asn": ["AS7922", "AS3320"],
+            "continents": {
+                "north.america": {
+                    "name": "North America",
+                    "countries": {"United States": "US", "Canada": "CA"},
+                },
+                "europe": {"name": "Europe", "countries": {"Germany": "DE"}},
+            },
         }
     },
 }
@@ -366,7 +508,7 @@ async def test_targeting_options_filter_and_cap(stub):
     )
 
     assert result["match_count"] == 1
-    assert result["options"][0]["name"] == "berlin"
+    assert result["options"][0]["id"] == "berlin"
 
 
 async def test_targeting_options_respect_the_limit(stub):
@@ -381,7 +523,82 @@ async def test_isp_options_expose_the_value_to_send(stub):
     stub({}, settings=SETTINGS)
     result = await call("list_proxy_targeting_options", {"product": "rp", "kind": "isps"})
 
-    assert result["options"][0] == {"name": "Comcast", "value": "comcast", "countryCode": "US"}
+    assert result["options"][0] == {
+        "id": "comcastcable",
+        "name": "Comcast Cable",
+        "countries": ["US"],
+    }
+
+
+async def test_continent_options_expose_the_value_the_gateway_takes(stub):
+    """The catalogue keys continents by their wire value and shows a display name."""
+    stub({}, settings=SETTINGS)
+    result = await call(
+        "list_proxy_targeting_options", {"product": "rp", "kind": "continents"}
+    )
+
+    assert result["options"] == [
+        {"id": "europe", "name": "Europe", "country_count": 1},
+        {"id": "north.america", "name": "North America", "country_count": 2},
+    ]
+
+
+async def test_a_continent_id_from_the_catalogue_builds_a_working_string(
+    stub, products_payload
+):
+    """What the lookup returns has to be what the builder accepts."""
+    client = stub(products_payload, settings=SETTINGS)
+    options = await call(
+        "list_proxy_targeting_options", {"product": "rp", "kind": "continents"}
+    )
+
+    for option in options["options"]:
+        client.calls.clear()
+        built = await call(
+            "build_proxy_connection_string",
+            {"product": "rp", "continent": option["id"]},
+        )
+        assert f"continent-{option['id']}" in built["proxies"][0]["proxy"]
+        assert " " not in built["proxies"][0]["proxy"]
+
+
+async def test_every_kind_reports_an_id_and_a_name(stub):
+    stub({}, settings=SETTINGS)
+
+    for kind in ("countries", "regions", "cities", "isps", "continents"):
+        result = await call(
+            "list_proxy_targeting_options", {"product": "rp", "kind": kind}
+        )
+        assert result["options"], f"{kind} returned nothing"
+        for option in result["options"]:
+            assert option.get("id"), f"{kind} entry has no id"
+            assert option.get("name"), f"{kind} entry has no name"
+
+
+async def test_country_options_report_the_code_as_the_id(stub):
+    """The code is what the gateway takes; the country's name is the display form."""
+    stub({}, settings=SETTINGS)
+    result = await call("list_proxy_targeting_options", {"product": "rp"})
+
+    assert {"id": "DE", "name": "Germany"} in result["options"]
+
+
+async def test_options_come_back_sorted_by_id(stub):
+    stub({}, settings=SETTINGS)
+
+    for kind in ("countries", "cities", "continents"):
+        result = await call(
+            "list_proxy_targeting_options", {"product": "rp", "kind": kind}
+        )
+        ids = [option["id"] for option in result["options"]]
+        assert ids == sorted(ids), f"{kind} is unsorted"
+
+
+async def test_the_note_points_at_the_id_rather_than_the_displayed_name(stub):
+    stub({}, settings=SETTINGS)
+    result = await call("list_proxy_targeting_options", {"product": "rp"})
+
+    assert "id" in result["note"]
 
 
 async def test_targeting_options_reject_an_unknown_product(stub):

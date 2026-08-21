@@ -15,13 +15,16 @@ from typing import Any, Optional
 
 # Product codes as used by GET /public. The Public API is not internally
 # consistent about the datacenter product — /public and /settings call it
-# `dcp`, while /generate and /rotate_session accept only `sdc` — so `dcp` is
-# the code used throughout this server and translated at the call site.
+# `dcp`, while /generate, /rotate_session and /usage accept only `sdc` — so
+# `dcp` is the code used throughout this server and every endpoint that needs
+# a different one is given it from the `*_code` fields below. A `None` means
+# the endpoint does not serve that product at all.
 PRODUCTS: dict[str, dict[str, Any]] = {
     "rp": {
         "name": "Premium Residential",
         "generate_code": "rp",
         "rotate_code": "rp",
+        "usage_code": "rp",
         "https_endpoint": ("rp.evomi-proxy.com", 1001),
         "geo": ("country", "region", "city", "zip", "isp", "asn", "continent"),
         "supports_expert_filters": True,
@@ -31,6 +34,7 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "name": "Core Residential",
         "generate_code": "rpc",
         "rotate_code": "rpc",
+        "usage_code": "rpc",
         # No HTTPS-proxy hostname is documented for the core endpoint.
         "https_endpoint": None,
         "geo": ("country", "region", "city", "zip", "asn", "continent"),
@@ -41,6 +45,7 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "name": "Datacenter (Shared)",
         "generate_code": "sdc",
         "rotate_code": "sdc",
+        "usage_code": "sdc",
         "https_endpoint": ("dcp.evomi-proxy.com", 2001),
         "geo": ("country", "continent"),
         "supports_expert_filters": False,
@@ -50,6 +55,7 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "name": "Mobile",
         "generate_code": "mp",
         "rotate_code": "mp",
+        "usage_code": "mp",
         "https_endpoint": ("mp.evomi-proxy.com", 3001),
         "geo": ("country", "region", "isp", "continent"),
         "supports_expert_filters": False,
@@ -59,6 +65,8 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "name": "Static Residential",
         "generate_code": "static_residential",
         "rotate_code": None,
+        # Billed per rented IP, so /usage does not accept it.
+        "usage_code": None,
         "https_endpoint": None,
         # The rented IP fixes the location, so no targeting parameters apply.
         "geo": (),
@@ -69,6 +77,7 @@ PRODUCTS: dict[str, dict[str, Any]] = {
 
 PRODUCT_CODES = tuple(PRODUCTS)
 ROTATABLE_PRODUCTS = tuple(code for code, spec in PRODUCTS.items() if spec["rotate_code"])
+MEASURABLE_PRODUCTS = tuple(code for code, spec in PRODUCTS.items() if spec["usage_code"])
 
 # GET /public reports Static Residential as packages of IPs with no gateway
 # hostname. Gateways are assigned per account, so this documented default is a
@@ -77,6 +86,40 @@ STATIC_GATEWAY_HOST = "isp-2.evomi.com"
 
 SESSION_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{6,10}$")
+
+# ISO 3166-1 alpha-2, plus XK for Kosovo, which has no assigned code and which
+# the gateway accepts. Availability is per product and per account; this only
+# rules out codes no product can have.
+COUNTRY_CODES = frozenset(
+    """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ
+    BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR
+    CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR
+    GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU
+    ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ
+    LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ
+    MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF
+    PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI
+    SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR
+    TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW
+    """.split()
+)
+
+# Codes people reach for that the gateway does not know, with what to send.
+COUNTRY_ALIASES = {"UK": "GB", "EL": "GR", "EN": "GB", "USA": "US"}
+
+# Every continent the gateway targets, in its spelling. The catalogue states
+# these as display names ("North America"), which the gateway does not take.
+CONTINENTS = ("africa", "asia", "europe", "north.america", "oceania", "south.america")
+
+# The gateway's own spelling for a targeting value: lowercase, words joined
+# with dots. `list_proxy_targeting_options` reports these as `id`.
+WIRE_VALUE_PATTERN = re.compile(r"^[a-z0-9.\-]+$")
+
+# What may appear in a password modifier. The password is interpolated into
+# `scheme://user:password@host:port`, so anything outside this set can produce
+# a string no HTTP client will parse.
+MODIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.,_\-]*$")
 
 FORMAT_TEMPLATES = {
     "url": "{scheme}://{username}:{password}@{host}:{port}",
@@ -93,6 +136,93 @@ class ProxyOptionError(ValueError):
 def new_session_id(length: int = 8) -> str:
     """Generate a session identifier in the 6-10 alphanumeric range Evomi accepts."""
     return "".join(_secrets.choice(SESSION_ID_ALPHABET) for _ in range(length))
+
+
+def to_wire_value(value: str, field: str) -> str:
+    """
+    Render a geo value the way the gateway spells it.
+
+    `list_proxy_targeting_options` reports both spellings for these fields — the
+    gateway's under `id`, the human's under `name` — and the two differ by case
+    and by spaces standing where dots belong. A display form is accepted here
+    and converted; anything left outside the gateway's alphabet is refused,
+    because interpolating it into a password produces a connection string that
+    no HTTP client can parse.
+    """
+    wire = re.sub(r"[\s_]+", ".", str(value).strip().lower())
+
+    if not WIRE_VALUE_PATTERN.match(wire):
+        raise ProxyOptionError(
+            f"'{value}' is not a usable {field}. Call list_proxy_targeting_options "
+            f"for the {field} values this product accepts and pass the 'id' field."
+        )
+
+    return wire
+
+
+def normalise_continent(value: str) -> str:
+    """
+    Check a continent and return it as the gateway wants it.
+
+    A display name is converted; anything that is not one of the six is refused
+    here rather than at connect time, where it surfaces as a bare 'failed to
+    select from pool'.
+    """
+    wire = to_wire_value(value, "continent")
+
+    if wire not in CONTINENTS:
+        raise ProxyOptionError(
+            f"'{value}' is not a continent the gateway targets. Use one of: "
+            f"{', '.join(CONTINENTS)}."
+        )
+
+    return wire
+
+
+def _wire_isp(value: str) -> str:
+    """
+    Check an ISP value and return it as the gateway wants it.
+
+    Unlike the other geo fields, an ISP's display label cannot be converted to
+    its wire form: the catalogue truncates the label and drops its spaces, so
+    'SAT TELECOMMUNICATIONS LTD' is 'sattelecommunic' and there is no rule that
+    recovers the cut. Case is fixed here and anything else is refused.
+    """
+    wire = str(value).strip().lower()
+
+    if not WIRE_VALUE_PATTERN.match(wire):
+        raise ProxyOptionError(
+            f"'{value}' is not an ISP identifier the gateway accepts. Call "
+            "list_proxy_targeting_options with kind='isps' and pass the 'id' field, "
+            "which is not simply the ISP's name in lower case."
+        )
+
+    return wire
+
+
+def normalise_country(code: str) -> str:
+    """
+    Check one country code and return it as the gateway wants it.
+
+    A code the gateway does not know is refused here rather than at connect
+    time, where it surfaces as a bare 'failed to select from pool'.
+    """
+    cleaned = str(code).strip().upper()
+
+    if cleaned in COUNTRY_CODES:
+        return cleaned
+
+    alias = COUNTRY_ALIASES.get(cleaned)
+    if alias:
+        raise ProxyOptionError(
+            f"'{code}' is not an ISO 3166-1 alpha-2 country code. Use '{alias}'."
+        )
+
+    raise ProxyOptionError(
+        f"'{code}' is not an ISO 3166-1 alpha-2 country code. Use two-letter codes "
+        "such as 'US' or 'DE', and call list_proxy_targeting_options to see which "
+        "countries this product covers."
+    )
 
 
 def resolve_endpoint(
@@ -200,19 +330,19 @@ def build_password_modifiers(
         )
 
     if countries:
-        modifiers.append("country-" + ",".join(c.strip().upper() for c in countries))
+        modifiers.append("country-" + ",".join(normalise_country(c) for c in countries))
     if continent:
-        modifiers.append(f"continent-{continent}")
+        modifiers.append(f"continent-{normalise_continent(continent)}")
     if region:
-        modifiers.append(f"region-{region}")
+        modifiers.append(f"region-{to_wire_value(region, 'region')}")
     if city:
-        modifiers.append(f"city-{city}")
+        modifiers.append(f"city-{to_wire_value(city, 'city')}")
     if zip_code:
-        modifiers.append(f"zip-{zip_code}")
+        modifiers.append(f"zip-{str(zip_code).strip()}")
     if isp:
-        modifiers.append(f"isp-{isp}")
+        modifiers.append(f"isp-{_wire_isp(isp)}")
     if asn:
-        modifiers.append(f"asn-{asn}")
+        modifiers.append(f"asn-{str(asn).strip().upper()}")
 
     resolved_session_id: Optional[str] = None
     if session:
@@ -291,6 +421,14 @@ def build_password_modifiers(
             "Static Residential proxies take no targeting parameters — the rented "
             "IP fixes the location and does not rotate."
         )
+
+    for modifier in modifiers:
+        if not MODIFIER_PATTERN.match(modifier):
+            raise ProxyOptionError(
+                f"'{modifier}' cannot go into a proxy password: it would produce a "
+                "connection string that no HTTP client can parse. Call "
+                "list_proxy_targeting_options and pass the 'id' of the value you want."
+            )
 
     return modifiers, resolved_session_id
 

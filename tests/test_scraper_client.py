@@ -354,3 +354,46 @@ def test_the_error_message_is_json_safe_for_a_tool_result(monkeypatch):
         asyncio.run(client.scrape("https://example.com"))
 
     assert json.loads(json.dumps({"error": str(excinfo.value)}))
+
+
+def test_a_rejected_request_reports_the_reason_the_api_gave(monkeypatch):
+    """The line naming the offending field sits a level down, under error.details."""
+    body = {
+        "success": False,
+        "status_code": 422,
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Invalid request parameters",
+            "details": {
+                "validation_errors": [
+                    ": Value error, Datacenter proxies can only be used with "
+                    "mode='request'. Browser and auto modes require premium "
+                    "(residential) proxies."
+                ]
+            },
+        },
+    }
+    _routes(monkeypatch, scrape=(422, body))
+
+    with pytest.raises(EvomiScraperAPIError) as raised:
+        asyncio.run(EvomiClient().scrape("https://example.com"))
+
+    message = str(raised.value)
+    assert "422" in message
+    assert "Datacenter proxies can only be used with mode='request'" in message
+    assert "Invalid request parameters" in message
+
+
+def test_a_nested_error_detail_still_hides_the_key(monkeypatch):
+    body = {
+        "error": {
+            "message": f"rejected {SCRAPER_KEY}",
+            "details": {"hint": SCRAPER_KEY},
+        }
+    }
+    _routes(monkeypatch, scrape=(400, body))
+
+    with pytest.raises(EvomiScraperAPIError) as raised:
+        asyncio.run(EvomiClient().scrape("https://example.com"))
+
+    assert SCRAPER_KEY not in str(raised.value)

@@ -178,7 +178,12 @@ class EvomiPublicClient:
     # ─── Usage & Targeting ──────────────────────────────────────────────────────
 
     async def get_usage(self, product: str, period: str = "3d") -> dict[str, Any]:
-        """GET /public/usage — bandwidth and request statistics for one product."""
+        """
+        GET /public/usage — bandwidth and request statistics for one product.
+
+        `product` is this endpoint's own code for it, which is not the code every
+        endpoint uses; callers take it from the product's `usage_code`.
+        """
         return await self._get("/usage", params={"product": product, "period": period})
 
     async def get_settings(self) -> dict[str, Any]:
