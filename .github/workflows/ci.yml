@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Dependencies are resolved at install time, so a weekly rebuild against
+  # freshly resolved ones catches a breaking upstream release before a user's
+  # install does.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # "mcp<2" is what an environment already pinned to 1.x resolves to,
+        # "mcp>=2" what a fresh install resolves to; the suite passes on both.
+        mcp-version: ["mcp<2", "mcp>=2,<3"]
+        include:
+          # The declared floor, which has a different call_tool decorator from
+          # later 1.x: no CallToolResult passthrough and its own input
+          # validation. Keep this pin equal to the floor in pyproject.toml.
+          - python-version: "3.12"
+            mcp-version: "mcp==1.8.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Pin the mcp SDK for this matrix leg
+        run: pip install "${{ matrix.mcp-version }}"
+
+      - name: Show resolved dependency versions
+        run: pip list
+
+      - name: Import the server module
+        run: python -c "import evomi_mcp.server"
+
+      - name: Run the console entry point
+        # Bounded because the failure mode is a hang, not an error: an SDK
+        # whose stdio_server ignores EOF leaves this waiting until the job hits
+        # the six-hour limit.
+        run: |
+          timeout 30 sh -c "printf '' | evomi-mcp"
+
+      - name: Run tests
+        run: pytest -v
+
+  # Expected to fail the day an mcp 3.0 ships, so it reports without blocking a
+  # PR: the ceiling in pyproject.toml is a bound with a warning attached.
+  unreleased-sdk:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install against the newest mcp, ignoring our ceiling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install --upgrade --pre mcp
+
+      - run: pip list
+
+      - name: Run tests against it
+        run: pytest -v
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
+      - name: Install the built wheel into a clean environment and import it
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/pip install dist/*.whl
+          /tmp/verify/bin/python -c "import evomi_mcp.server; print('import OK')"
+          timeout 30 sh -c "printf '' | /tmp/verify/bin/evomi-mcp"

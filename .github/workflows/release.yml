@@ -1,0 +1,174 @@
+name: Release
+
+# Publishing is triggered by a published GitHub Release, not by a tag push, so
+# an upload to PyPI is always a deliberate step. The version gate below pins the
+# artifact to the tag being released.
+#
+# `workflow_dispatch` is a dry run against TestPyPI and nothing else: no input
+# lets a manual run reach the real index.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Nothing is granted by default; each job asks for the minimum it needs.
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify the version being released
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A version that disagrees with the tag is only discovered by whoever
+      # pip-installs it, so fail here instead. On a manual dry run there is no
+      # tag, but the two files must still agree.
+      - name: pyproject.toml, __init__.py and the release tag must agree
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            python scripts/check_version.py --expect "$RELEASE_TAG"
+          else
+            python scripts/check_version.py
+          fi
+
+  build:
+    name: Build and check distributions
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      # `--strict`, unlike the same step in ci.yml: a README that fails to
+      # render on PyPI cannot be fixed without spending a version number.
+      - name: Check the metadata of what was built
+        run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  test:
+    name: Test the built wheel (${{ matrix.python-version }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        # The ends of the supported range. CI covers every minor on every
+        # push; what this adds is that the suite ran against this artifact,
+        # with dependencies resolved today.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install the wheel that is about to be published
+        run: |
+          python -m pip install --upgrade pip
+          pip install dist/*.whl pytest pytest-asyncio
+
+      - name: Show resolved dependency versions
+        run: pip list
+
+      # `pytest tests/` puts `tests/` on sys.path, not the repo root, so
+      # `import evomi_mcp` resolves to the installed wheel in site-packages
+      # rather than to `src/`.
+      - name: Run the suite against the installed wheel
+        run: pytest -v tests/
+
+      - name: Run the console entry point
+        # Bounded: the entry point reads a stdio protocol, so a regression that
+        # blocks on stdin instead of exiting at EOF would otherwise hang the
+        # job for GitHub's six-hour default rather than failing.
+        run: timeout 30s sh -c "printf '' | evomi-mcp"
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'release'
+    needs: [verify, build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Named so required reviewers can be configured in repository settings
+    # without editing this file. PyPI's trusted publisher must name the same
+    # environment.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/evomi-mcp
+    permissions:
+      # The only permission Trusted Publishing needs, and the only one this job
+      # gets: it mints a short-lived OIDC token that PyPI exchanges for an
+      # upload token scoped to this project. No secret is stored anywhere, so
+      # there is no long-lived credential to leak or rotate.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Publishes with PEP 740 attestations. No `username`/`password`:
+      # supplying either would disable Trusted Publishing. `skip-existing` is
+      # deliberately not set — a duplicate version means the release is
+      # confused and should fail loudly rather than pass as a no-op.
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+
+  publish-testpypi:
+    name: Dry run — publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: [verify, build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/evomi-mcp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # Re-running a dry run at the same version is the normal way to use
+          # it, and TestPyPI would otherwise reject it.
+          skip-existing: true
